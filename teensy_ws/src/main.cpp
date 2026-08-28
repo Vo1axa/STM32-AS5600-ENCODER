@@ -6,9 +6,6 @@ USBHub hub1(usb);
 USBHIDParser hid1(usb);
 JoystickController joystick(usb);
 
-// ============================================================
-// JOYSTICK CONFIG
-// ============================================================
 #define AXIS_LX 0   // stick KIRI, sumbu X -> strafe (vy)
 #define AXIS_LY 1   // stick KIRI, sumbu Y -> maju/mundur (vx)
 #define AXIS_RX 2   // stick KANAN, sumbu X -> rotasi (omega)
@@ -16,12 +13,8 @@ JoystickController joystick(usb);
 #define AXIS_MAX 255
 #define AXIS_CENTER 128
 #define AXIS_DEADZONE 15
-
-// ============================================================
-// KINEMATIK 3-RODA SWERVE
-// ============================================================
 #define WHEEL_DISTANCE 0.25f
-#define MAX_CMD_SPEED  150.0f
+#define MAX_CMD_SPEED  255.0f
 
 class Kinematic3 {
 public:
@@ -39,8 +32,8 @@ public:
   ModuleState calculate(float vx, float vy, float omega) {
     ModuleState s;
     for (int i = 0; i < 3; i++) {
-      float vix = vx - omega * ry_[i];
-      float viy = vy + omega * rx_[i];
+      float vix = vx + omega * rx_[i];
+      float viy = vy - omega * ry_[i];
       s.speed[i] = sqrtf(vix * vix + viy * viy);
       s.angle[i] = atan2f(viy, vix);
     }
@@ -72,10 +65,6 @@ private:
   float rx_[3], ry_[3];
 };
 
-// ============================================================
-// KOMUNIKASI — 1 PACKET, TANPA ID
-// Format: [0xAA] [angle:4B] [speed:4B] [checksum:1B] = 10 byte
-// ============================================================
 #define CMD_HEADER    0xAA
 #define SEND_INTERVAL 20   // ms (~50 Hz)
 
@@ -84,7 +73,7 @@ struct __attribute__((packed)) DriveCmd {
   float speed;
 };
 
-void sendDriveCmd(float angle, float speed)
+void sendDriveCmd(HardwareSerial &port, float angle, float speed)
 {
   DriveCmd cmd = { angle, speed };
   uint8_t buf[sizeof(DriveCmd)];
@@ -93,27 +82,23 @@ void sendDriveCmd(float angle, float speed)
   uint8_t checksum = 0;
   for (size_t i = 0; i < sizeof(DriveCmd); i++) checksum ^= buf[i];
 
-  Serial3.write(CMD_HEADER);
-  Serial3.write(buf, sizeof(DriveCmd));
-  Serial3.write(checksum);
+  port.write(CMD_HEADER);
+  port.write(buf, sizeof(DriveCmd));
+  port.write(checksum);
 }
 
-// ============================================================
-// GLOBALS
-// ============================================================
 Kinematic3 kinematic(WHEEL_DISTANCE);
 uint32_t lastButtons = 0;
 int currentSpeedMult = 1;
 unsigned long lastSend = 0;
 float currentAngles[3] = { 0.0f, 0.0f, 0.0f };  // sudut steering sekarang (rad)
 
-// ============================================================
-// SETUP & LOOP
-// ============================================================
 void setup()
 {
   Serial.begin(115200);
   Serial3.begin(115200);
+  Serial4.begin(115200);
+  Serial5.begin(115200);
   usb.begin();
 }
 
@@ -182,10 +167,12 @@ void loop()
   float oS2 = optSpeed[1];
   float oS3 = optSpeed[2];
 
-  // Kirim hanya 1 module (module 1 / depan) untuk testing sekarang
+  // Kirim semua 3 module
   if (millis() - lastSend >= SEND_INTERVAL) {
     lastSend = millis();
-    sendDriveCmd(oA1, oS1);  // <-- cuma module 1, sudah optimized
+    sendDriveCmd(Serial5, oA1, oS1);  // module 1 (depan) -> Serial5
+    sendDriveCmd(Serial3, oA3, oS3);  // module 2 (belakang kiri) -> Serial3
+    sendDriveCmd(Serial4, oA2, oS2);  // module 3 (belakang kanan) -> Serial4
 
     // Debug 3 module di Serial USB
     Serial.print("M1:"); Serial.print(oA1,1); Serial.print("° "); Serial.print(oS1,1);
