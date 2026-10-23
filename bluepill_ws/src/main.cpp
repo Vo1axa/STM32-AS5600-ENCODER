@@ -1,5 +1,23 @@
 #include <Arduino.h>
+#include <Wire.h>
 #include "config.h"
+#include "as5600.h"
+
+// ---- AS5600 steering sensor on I2C2 (PB10 = SCL, PB11 = SDA) ----
+// PB6/PB7 are already used by serial1 (Teensy link), so I2C1 is not available.
+// You can move these defines into config.h if you prefer (config.h wins).
+#ifndef AS5600_SDA
+#define AS5600_SDA PB11
+#endif
+#ifndef AS5600_SCL
+#define AS5600_SCL PB10
+#endif
+#ifndef AS5600_ZERO_DEG
+#define AS5600_ZERO_DEG 0.0f   // rawDeg when the wheel points straight (see 'z' command)
+#endif
+#ifndef AS5600_INVERT
+#define AS5600_INVERT false    // flip if positive PWM makes the angle go DOWN (see 't' command)
+#endif
 
 #define DRIVE_CMD_TIMEOUT 500  // ms, auto-stop kalau tidak ada command
 #define TICKS_PER_REV 320.0
@@ -31,10 +49,17 @@ void homing();
 float getAngle();
 void goToAngle(float targetAngle);
 void readSerialCommand();
+void handleDebugCommand();
+void testSteeringDirection();
 
 void (*const encoderIsr[NUM_ENCODERS])() = {readEncoder<0>};
 
 HardwareSerial serial1(PB7, PB6);
+
+// AS5600 absolute steering sensor
+TwoWire as5600Wire(AS5600_SDA, AS5600_SCL);
+AS5600 steeringSensor(as5600Wire, AS5600_ZERO_DEG, AS5600_INVERT);
+bool useAs5600 = false;
 
 void setup()
 {
@@ -69,10 +94,29 @@ void setup()
 
     attachInterrupt(digitalPinToInterrupt(enca[i]), encoderIsr[i], RISING);
   }
+
+  // AS5600: absolute angle -> no reed switch homing needed.
+  // If it is not found, fall back to the old reed switch + quadrature encoder.
+  useAs5600 = steeringSensor.begin();
+  if (useAs5600)
+  {
+    homingDone = true;
+    Serial.println("AS5600 OK: using absolute steering angle");
+  }
+  else
+  {
+    Serial.print("AS5600 not found / no magnet (status 0x");
+    Serial.print(steeringSensor.status(), HEX);
+    Serial.println(") -> using reed switch homing + quadrature encoder");
+  }
 }
 
 void loop()
 {
+  handleDebugCommand();
+
+  if (useAs5600) steeringSensor.update();
+
   homing();
 
   static unsigned long lastPrint = 0;
@@ -88,7 +132,18 @@ void loop()
     Serial.print(" | angleCmd: ");
     Serial.print(targetAngleCmd);
     Serial.print(" | speedCmd: ");
-    Serial.println(targetSpeedCmd);
+    Serial.print(targetSpeedCmd);
+    if (useAs5600)
+    {
+      Serial.print(" || AS5600 angle: ");
+      Serial.print(steeringSensor.angleDeg(), 1);
+      Serial.print(" | dir: ");
+      Serial.print(steeringSensor.directionStr());
+      Serial.print(" | vel: ");
+      Serial.print(steeringSensor.velocityDps(), 0);
+      Serial.print(" deg/s");
+    }
+    Serial.println();
   }
 
   if (!homingDone) return;
@@ -103,8 +158,65 @@ void loop()
     return;
   }
 
+  // lost the steering sensor while running -> stop everything (don't drive blind)
+  if (useAs5600 && !steeringSensor.healthy())
+  {
+    setMotor(MOTOR1_IN_A, MOTOR1_IN_B, 0);
+    setMotor(MOTOR2_IN_A, MOTOR2_IN_B, 0);
+    return;
+  }
+
   goToAngle(targetAngleCmd);
   setMotor(MOTOR2_IN_A, MOTOR2_IN_B, targetSpeedCmd);
+}
+
+// Serial monitor commands (USB):
+//   't' = test: pulse steering motor with +PWM and report which way the angle moved
+//   'z' = print the raw angle at the current position (use it for AS5600_ZERO_DEG)
+void handleDebugCommand()
+{
+  while (Serial.available())
+  {
+    char c = Serial.read();
+    if (!useAs5600) continue;
+
+    if (c == 'z')
+    {
+      Serial.print(">> Raw AS5600 angle here = ");
+      Serial.print(steeringSensor.rawDeg(), 2);
+      Serial.println(" deg. Put this in AS5600_ZERO_DEG (wheel must point straight).");
+    }
+    else if (c == 't')
+    {
+      testSteeringDirection();
+    }
+  }
+}
+
+// WARNING: moves the steering motor for ~0.2 s. Keep the module free to turn.
+void testSteeringDirection()
+{
+  steeringSensor.update();
+  float before = steeringSensor.angleDeg();
+
+  setMotor(MOTOR1_IN_A, MOTOR1_IN_B, PWM_MIN_MOVE);
+  delay(200);
+  setMotor(MOTOR1_IN_A, MOTOR1_IN_B, 0);
+  delay(100);
+
+  steeringSensor.update();
+  float moved = fmod(steeringSensor.angleDeg() - before + 540.0f, 360.0f) - 180.0f;
+
+  Serial.print(">> Positive PWM changed the angle by ");
+  Serial.print(moved, 1);
+  Serial.println(" deg");
+
+  if (moved > 1.0f)
+    Serial.println(">> Direction OK (keep AS5600_INVERT as it is)");
+  else if (moved < -1.0f)
+    Serial.println(">> Direction REVERSED: flip AS5600_INVERT, upload, run 't' again");
+  else
+    Serial.println(">> No movement detected (motor blocked, or PWM too low?)");
 }
 
 void readSerialCommand()
@@ -164,7 +276,8 @@ void homing()
 
 float getAngle()
 {
-  return (pos[0] / TICKS_PER_REV) * 360.0;
+  if (useAs5600) return steeringSensor.angleDeg();   // absolute, 0..360
+  return (pos[0] / TICKS_PER_REV) * 360.0;           // fallback: quadrature encoder
 }
 
 void goToAngle(float targetAngle)
